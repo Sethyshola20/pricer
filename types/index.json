@@ -1,0 +1,18 @@
+[{
+  "S": 100.0,
+  "K": 100.0,
+  "r": 0.01,
+  "sigma": 0.2,
+  "T": 0.5,
+  "type": "call"
+},
+{
+  "type": "price_result",
+  "data": {
+    "price": 8.43332,
+    "delta": 0.5398,
+    "vega": 23.45,
+    "ts_server": 169
+  }
+}
+]
