@@ -5,6 +5,16 @@ const WS_PORT = Number(process.env.WS_PORT || 8080);
 const PRICER_HOST = process.env.PRICER_HOST || "pricer-cpp"; 
 const PRICER_PORT = Number(process.env.PRICER_PORT || 9000);
 
+type BSParams = {
+    spot: number;
+    strike: number;
+    rate: number;
+    volatility: number;
+    maturity: number;
+    type: "call" | "put";
+}
+
+
 console.log("PRICER_HOST",PRICER_HOST)
 console.log(`Starting Bun proxy. WS_PORT=${WS_PORT}, PRICER=${PRICER_HOST}:${PRICER_PORT}`);
 
@@ -23,8 +33,6 @@ wss.on("connection", (ws) => {
   let responseBuffer = Buffer.alloc(0);
 
   socket.on("data", (data: Buffer) => {
-    console.log("data",data)
-    console.log(responseBuffer,"responseBuffer")
     responseBuffer = Buffer.concat([responseBuffer, data]);
     while (responseBuffer.length >= 24) {
       const chunk = responseBuffer.slice(0, 24);
@@ -57,13 +65,13 @@ wss.on("connection", (ws) => {
   ws.on("message", (message: WebSocket.Data) => {
     try {
       const text = (typeof message === "string") ? message : message.toString();
-      const req = JSON.parse(text);
-      console.log(message,"message")
-      const S = Number(req.S);
-      const K = Number(req.K);
-      const r = Number(req.r);
-      const sigma = Number(req.sigma);
-      const T = Number(req.T);
+      const req = JSON.parse(text) as BSParams;
+      
+      const S = Number(req.spot);
+      const K = Number(req.strike);
+      const r = Number(req.rate);
+      const sigma = Number(req.volatility);
+      const T = Number(req.maturity);
       const type = (req.type === "put") ? 1 : 0;
 
       const buf = Buffer.alloc(41);
@@ -78,6 +86,8 @@ wss.on("connection", (ws) => {
         if (err) {
           console.error("Failed to write to pricer:", err);
           try { ws.send(JSON.stringify({ type: "error", message: "Failed to send to pricer" })); } catch (_) {}
+        }else{
+          console.log("wrote the bytes", buf)
         }
       });
     } catch (e) {
