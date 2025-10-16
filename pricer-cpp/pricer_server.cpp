@@ -9,7 +9,39 @@ using boost::asio::ip::tcp;
 
 enum class OptionType : uint8_t { Call = 0, Put = 1 };
 
-struct BSParams { double S, K, r, sigma, T; OptionType type; };
+struct BinomialParams : BSParams {
+    uint32_t steps;
+};
+
+struct BinomialResult : BSResult {};
+
+BinomialResult binomial_tree_price(const BinomialParams& p) {
+    const double dt = p.T / p.steps;
+    const double u = std::exp(p.sigma * std::sqrt(dt));
+    const double d = 1.0 / u;
+    const double disc = std::exp(-p.r * dt);
+    const double q = (std::exp(p.r * dt) - d) / (u - d);
+
+    std::vector<double> prices(p.steps + 1);
+    std::vector<double> option(p.steps + 1);
+
+    for (size_t i = 0; i <= p.steps; ++i) {
+        double ST = p.S * std::pow(u, p.steps - i) * std::pow(d, i);
+        option[i] = (p.type == OptionType::Call) ? std::max(0.0, ST - p.K) : std::max(0.0, p.K - ST);
+    }
+
+    for (int step = p.steps - 1; step >= 0; --step) {
+        for (int i = 0; i <= step; ++i) {
+            option[i] = disc * (q * option[i] + (1 - q) * option[i + 1]);
+        }
+    }
+
+    double delta = (option[1] - option[0]) / (p.S * (u - d));
+    return { option[0], delta, 0.0 };
+}
+
+
+struct BSParams { double S, K, r, sigma, T; OptionType type; uint32_t steps = 0; };
 struct BSResult { double price, delta, vega; };
 
 std::ostream& operator<<(std::ostream& os, const BSParams& p) {
@@ -67,16 +99,16 @@ public:
 
 private:
     tcp::socket socket_;
-    std::array<char, 41> reqbuf_; 
+    std::array<char, 45> reqbuf_; 
     std::array<char, 24> resbuf_; 
 
     void do_read() {
         auto self = shared_from_this();
         boost::asio::async_read(socket_, boost::asio::buffer(reqbuf_),
             [this, self](boost::system::error_code ec, std::size_t bytes_transferred ) {
-                if (!ec && bytes_transferred == 41) {
+                if (!ec && bytes_transferred == 45) {
                     std::cout << "Raw request bytes: ";
-                    for (size_t i = 0; i < 41; ++i) {
+                    for (size_t i = 0; i < 45; ++i) {
                         printf("%02x ", static_cast<unsigned char>(reqbuf_[i]));
                     }
                     std::cout << std::endl;
@@ -90,13 +122,22 @@ private:
                     uint8_t t = static_cast<uint8_t>(reqbuf_[40]);
                     p.type = (t == 0) ? OptionType::Call : OptionType::Put;
 
+                    uint32_t steps;
+                    std::memcpy(&steps, reqbuf_.data() + 41, 4);
+
                     std::cout << "Decoded params: " << p << std::endl;
 
-                    BSResult out = black_scholes(p);
-
-                    std::memcpy(resbuf_.data() + 0, &out.price, 8);
-                    std::memcpy(resbuf_.data() + 8, &out.delta, 8);
-                    std::memcpy(resbuf_.data() + 16, &out.vega, 8);
+                    if(steps > 0) {
+                        BinomialResult out = binomial_tree_price(p);
+                        std::memcpy(resbuf_.data() + 0, &out.price, 8);
+                        std::memcpy(resbuf_.data() + 8, &out.delta, 8);
+                        std::memcpy(resbuf_.data() + 16, &out.vega, 8);
+                    }else {
+                        BSResult out = black_scholes(p);
+                        std::memcpy(resbuf_.data() + 0, &out.price, 8);
+                        std::memcpy(resbuf_.data() + 8, &out.delta, 8);
+                        std::memcpy(resbuf_.data() + 16, &out.vega, 8);
+                    }
 
                     do_write();
                 } else {
