@@ -7,6 +7,7 @@ services:
     container_name: pricer-cpp
     volumes:
       - ./pricer-cpp:/app
+      - pricer-data:/data
     ports:
       - "9000:9000"
     restart: unless-stopped
@@ -38,3 +39,6 @@ services:
       - ./ui-react:/app
       - /app/node_modules
     restart: unless-stopped
+    
+volumes:
+  pricer-data:  

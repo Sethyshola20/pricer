@@ -20,49 +20,66 @@ console.log(`Starting Bun proxy. WS_PORT=${WS_PORT}, PRICER=${PRICER_HOST}:${PRI
 
 const wss = new WebSocketServer({ port: WS_PORT });
 
-wss.on("listening", () => {
-  console.log(`WebSocket server listening on ws://0.0.0.0:${WS_PORT}`);
-});
+// In your Bun proxy
+const activeSockets = new Map(); // Track WebSocket to TCP socket mapping
 
 wss.on("connection", (ws) => {
-  const socket = new net.Socket();
-  socket.connect(PRICER_PORT, PRICER_HOST, () => {
-    console.log("Connected to pricer daemon");
-  });
+  console.log("New WebSocket connection");
+  
+  let socket: net.Socket | null = null;
+  
+  const connectToPricer = () => {
+    socket = new net.Socket();
+    
+    socket.connect(PRICER_PORT, PRICER_HOST, () => {
+      console.log("Connected to pricer daemon");
+    });
 
-  let responseBuffer = Buffer.alloc(0);
+    let responseBuffer = Buffer.alloc(0);
 
-  socket.on("data", (data: Buffer) => {
-    responseBuffer = Buffer.concat([responseBuffer, data]);
-    while (responseBuffer.length >= 24) {
-      const chunk = responseBuffer.slice(0, 24);
-      responseBuffer = responseBuffer.slice(24);
+    socket.on("data", (data: Buffer) => {
+      responseBuffer = Buffer.concat([responseBuffer, data]);
+      while (responseBuffer.length >= 24) {
+        const chunk = responseBuffer.slice(0, 24);
+        responseBuffer = responseBuffer.slice(24);
 
-      const price = chunk.readDoubleLE(0);
-      const delta = chunk.readDoubleLE(8);
-      const vega = chunk.readDoubleLE(16);
+        const price = chunk.readDoubleLE(0);
+        const delta = chunk.readDoubleLE(8);
+        const vega = chunk.readDoubleLE(16);
 
-      const msg = {
-        type: "price_result",
-        data: {
-          price: Number.isFinite(price) ? price : null,
-          delta: Number.isFinite(delta) ? delta : null,
-          vega: Number.isFinite(vega) ? vega : null,
-          ts_server: Date.now()
-        }
-      };
-      try {
-        ws.send(JSON.stringify(msg));
-      } catch (_) {}
-    }
-  });
+        const msg = {
+          type: "price_result",
+          data: {
+            price: Number.isFinite(price) ? price : null,
+            delta: Number.isFinite(delta) ? delta : null,
+            vega: Number.isFinite(vega) ? vega : null,
+            ts_server: Date.now()
+          }
+        };
+        try {
+          ws.send(JSON.stringify(msg));
+        } catch (_) {}
+      }
+    });
 
-  socket.on("error", (err) => {
-    console.error("TCP socket error:", err?.message ?? err);
-    try { ws.close(); } catch (_) {}
-  });
+    socket.on("error", (err) => {
+      console.error("TCP socket error:", err?.message ?? err);
+    });
+
+    socket.on("close", () => {
+      console.log("TCP connection closed");
+    });
+  };
+
+  // Connect immediately when WebSocket opens
+  connectToPricer();
 
   ws.on("message", (message: WebSocket.Data) => {
+    if (!socket || socket.destroyed) {
+      console.log("Reconnecting TCP socket...");
+      connectToPricer();
+    }
+    
     try {
       const text = (typeof message === "string") ? message : message.toString();
       const req = JSON.parse(text) as OptionParams;
@@ -73,37 +90,51 @@ wss.on("connection", (ws) => {
       const sigma = Number(req.volatility);
       const T = Number(req.maturity);
       const type = (req.type === "put") ? 1 : 0;
+      const steps = req.steps ?? 0;
 
-      const buf = Buffer.alloc(req.steps ? 45 : 41);
+      const buf = Buffer.alloc(43);
       buf.writeDoubleLE(S, 0);
       buf.writeDoubleLE(K, 8);
       buf.writeDoubleLE(r, 16);
       buf.writeDoubleLE(sigma, 24);
       buf.writeDoubleLE(T, 32);
       buf.writeUInt8(type, 40);
-      if(req.steps) buf.writeUInt32LE(req.steps, 41);
+      buf.writeUInt16LE(steps, 41);
 
-      socket.write(buf, (err) => {
-        if (err) {
-          console.error("Failed to write to pricer:", err);
-          try { ws.send(JSON.stringify({ type: "error", message: "Failed to send to pricer" })); } catch (_) {}
-        }else{
-          console.log(buf.byteLength)
-        }
-      });
+      if (socket && !socket.destroyed) {
+        socket.write(buf, (err) => {
+          if (err) {
+            console.error("Failed to write to pricer:", err);
+          } else {
+            console.log("Successfully sent request to pricer");
+          }
+        });
+      }
     } catch (e) {
-      const errMsg = { type: "error", message: "bad request or invalid JSON" };
-      try { ws.send(JSON.stringify(errMsg)); } catch (_) {}
+      console.error("Message processing error:", e);
     }
   });
 
   ws.on("close", () => {
     console.log("WebSocket closed, ending TCP socket");
-    try { socket.end(); } catch (_) {}
+    if (socket) {
+      socket.end();
+    }
   });
 
   ws.on("error", () => {
-    try { socket.destroy(); } catch (_) {}
+    if (socket) {
+      socket.destroy();
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("WebSocket closed, ending TCP socket");
+    try { socket?.end(); } catch (_) {}
+  });
+
+  ws.on("error", () => {
+    try { socket?.destroy(); } catch (_) {}
   });
 });
 

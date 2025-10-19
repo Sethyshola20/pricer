@@ -5,23 +5,10 @@
 #include <memory>
 #include <cstring>
 #include <vector>
+#include "types.h"
+#include "optiondb.h"
 
 using boost::asio::ip::tcp;
-
-enum class OptionType : uint8_t { Call = 0, Put = 1 };
-
-struct BSParams { 
-    double S, K, r, sigma, T; 
-    OptionType type; 
-    uint32_t steps = 0; 
-};
-
-struct BSResult { 
-    double price, delta, vega; 
-    
-    BSResult(double p = 0.0, double d = 0.0, double v = 0.0) 
-        : price(p), delta(d), vega(v) {}
-};
 
 static inline double norm_cdf(double x) {
     return 0.5 * (1.0 + std::erf(x / std::sqrt(2.0)));
@@ -116,49 +103,79 @@ BSResult black_scholes(const BSParams& p) {
 }
 
 class Session : public std::enable_shared_from_this<Session> {
+    private:
+        tcp::socket socket_;
+        OptionDatabase& db_;
+        
     public:
-        explicit Session(tcp::socket socket) : socket_(std::move(socket)) {}
+        explicit Session(tcp::socket socket, OptionDatabase& db) : socket_(std::move(socket)), db_(db) {}
+        
         void start() { do_read(); }
 
     private:
-        tcp::socket socket_;
-        std::array<char, 45> reqbuf_; 
+        static constexpr short req_buf_size_ = 43;
+        std::array<char, req_buf_size_> reqbuf_; 
         std::array<char, 24> resbuf_; 
 
         void do_read() {
             auto self = shared_from_this();
             boost::asio::async_read(socket_, boost::asio::buffer(reqbuf_),
                 [this, self](boost::system::error_code ec, std::size_t bytes_transferred ) {
-                    if (!ec && bytes_transferred == 45) {
+                    // Force immediate output
+                    std::cout << "DEBUG: Read " << bytes_transferred << " bytes, expected " << req_buf_size_ << std::endl;
+                    std::cout.flush();  // Force output
+                    
+                    if (!ec && bytes_transferred == req_buf_size_) {
                         BSParams p;
                         std::memcpy(&p.S, reqbuf_.data() + 0, 8);
                         std::memcpy(&p.K, reqbuf_.data() + 8, 8);
                         std::memcpy(&p.r, reqbuf_.data() + 16, 8);
                         std::memcpy(&p.sigma, reqbuf_.data() + 24, 8);
                         std::memcpy(&p.T, reqbuf_.data() + 32, 8);
+                        std::memcpy(&p.steps, reqbuf_.data() + 41, 2);
                         uint8_t t = static_cast<uint8_t>(reqbuf_[40]);
                         p.type = (t == 0) ? OptionType::Call : OptionType::Put;
 
-                        uint32_t steps;
-                        std::memcpy(&steps, reqbuf_.data() + 41, 4);
-                        p.steps = steps;
-
                         BSResult out;
-                        if(steps > 0) {
+                        std::string calculation_type;
+                        
+                        if(p.steps > 0) {
                             out = binomial_tree_price(p);
+                            calculation_type = "binomial";
                         } else {
                             out = black_scholes(p);
+                            calculation_type = "black_scholes";
+                        }
+                        std::cout << "DEBUG: Calculated - price: " << out.price 
+                          << ", delta: " << out.delta << ", vega: " << out.vega << std::endl;
+
+                        std::cout << "DEBUG: Storing in database..." << std::endl;
+                        int input_id = db_.store_input(p);
+                        std::cout << "DEBUG: store_input returned: " << input_id << std::endl;
+                
+                        if (input_id != -1) {
+                            bool output_stored = db_.store_output(input_id, out, calculation_type);
+                            std::cout << "DEBUG: store_output returned: " << output_stored << std::endl;
+                        } else {
+                            std::cout << "DEBUG: store_input failed!" << std::endl;
                         }
 
                         std::memcpy(resbuf_.data() + 0, &out.price, 8);
                         std::memcpy(resbuf_.data() + 8, &out.delta, 8);
                         std::memcpy(resbuf_.data() + 16, &out.vega, 8);
-
+                        
                         do_write();
+                    } else if (ec == boost::asio::error::eof) {
+                        std::cout << "DEBUG: Client disconnected gracefully" << std::endl;
+                        return;
+                    } else if (ec) {
+                        std::cout << "DEBUG: Read error: " << ec.message() << std::endl;
+                        return;
                     } else {
-                        std::cerr << "Read error or incomplete request: " << ec.message()
-                                << " (" << bytes_transferred << " bytes read)" << std::endl;
+                        std::cout << "DEBUG: Incomplete read: " << bytes_transferred << " bytes" << std::endl;
+                        return;
                     }
+
                 });
         }
 
@@ -168,38 +185,45 @@ class Session : public std::enable_shared_from_this<Session> {
                 [this, self](boost::system::error_code ec, std::size_t ) {
                     if (!ec) {
                         do_read();
-                    } else {
-                        std::cerr << "Write error: " << ec.message() << "\n";
                     }
                 });
         }
 };
 
 class Server {
-    public:
-        Server(boost::asio::io_context& io_context, uint16_t port)
-            : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)) {
-            do_accept();
-        }
-
     private:
         tcp::acceptor acceptor_;
+        OptionDatabase& db_;
+
         void do_accept() {
             acceptor_.async_accept([this](boost::system::error_code ec, tcp::socket socket) {
                 if (!ec) {
-                    std::make_shared<Session>(std::move(socket))->start();
+                    std::make_shared<Session>(std::move(socket), db_)->start();
                 }
                 do_accept();
             });
+        }
+    public:
+        Server(boost::asio::io_context& io_context, uint16_t port, OptionDatabase& db)
+            : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)), db_(db) {
+            do_accept();
         }
 };
 
 int main(int argc, char* argv[]) {
     try {
+        OptionDatabase db;
+        if (!db.initialize()) {
+            std::cerr << "Failed to initialize database" << std::endl;
+            return 1;
+        } 
+
         uint16_t port = 9000;
         if (argc > 1) port = static_cast<uint16_t>(std::stoi(argv[1]));
+        
         boost::asio::io_context io_context;
-        Server s(io_context, port);
+        Server s(io_context, port, db);
+        
         std::cout << "Pricer daemon listening on port " << port << "\n";
         io_context.run();
     } catch (std::exception& e) {
